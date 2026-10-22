@@ -12,6 +12,7 @@ class Codemas_Ewand_Product_Fields {
 
 	const STYLE_NO       = '_ce_style_no';
 	const STYLE_ID       = '_ce_ewand_style_id';
+	const STYLE_NAME     = '_ce_ewand_style_name';
 	const STYLE_DESC     = '_ce_style_desc';
 	const ITEM_NOTE      = '_ce_item_note';
 	const COMPONENTS     = '_ce_components';
@@ -128,13 +129,23 @@ class Codemas_Ewand_Product_Fields {
 		return implode( '/', array_map( fn( $code, $n ) => "$code($n)", array_keys( $counts ), $counts ) );
 	}
 
+	/**
+	 * "Verified: SK 196L WHHS = Ewand style WstnHghts Long Skirt" (falls back to "#656" when the name is unknown).
+	 */
+	private static function verified_message( $style_no, $style_id, $style_name ) {
+		$style_name = trim( (string) $style_name );
+		/* translators: 1: style number, 2: Ewand style name (or #ID) */
+		return sprintf( __( 'Verified: %1$s = Ewand style %2$s', 'codemas-ewand-ordersync' ), $style_no, '' !== $style_name ? $style_name : '#' . $style_id );
+	}
+
 	private static function sanitize_id( $value ) {
 		$value = trim( sanitize_text_field( wp_unslash( (string) $value ) ) );
 		return '' === $value ? '' : (string) absint( $value );
 	}
 
 	public static function render_variation_field( $loop, $variation_data, $variation ) {
-		$style_id = get_post_meta( $variation->ID, self::STYLE_ID, true );
+		$style_id   = get_post_meta( $variation->ID, self::STYLE_ID, true );
+		$style_name = $style_id ? get_post_meta( $variation->ID, self::STYLE_NAME, true ) : '';
 		woocommerce_wp_text_input( array(
 			'id'            => 'ce_variation_style_no_' . $loop,
 			'name'          => 'ce_variation_style_no[' . $loop . ']',
@@ -150,13 +161,13 @@ class Codemas_Ewand_Product_Fields {
 		<p class="form-row form-row-last ce-verify-row">
 			<label><?php esc_html_e( 'Ewand verification', 'codemas-ewand-ordersync' ); ?></label>
 			<input type="hidden" class="ce-style-id" name="ce_variation_style_id[<?php echo esc_attr( $loop ); ?>]" value="<?php echo esc_attr( $style_id ); ?>">
+			<input type="hidden" class="ce-style-name" name="ce_variation_style_name[<?php echo esc_attr( $loop ); ?>]" value="<?php echo esc_attr( $style_name ); ?>">
 			<button type="button" class="button ce-verify-style<?php echo $style_id ? ' is-ok' : ''; ?>"><?php echo $style_id ? esc_html__( '✓ Verified', 'codemas-ewand-ordersync' ) : esc_html__( 'Verify with Ewand', 'codemas-ewand-ordersync' ); ?></button>
 		</p>
 		<div class="form-row form-row-full ce-verify-status<?php echo $style_id ? ' is-ok' : ''; ?>"<?php echo $style_id ? '' : ' hidden'; ?>>
 			<?php
 			if ( $style_id ) {
-				/* translators: %s: Ewand style ID */
-				printf( esc_html__( 'Linked to Ewand style #%s', 'codemas-ewand-ordersync' ), esc_html( $style_id ) );
+				echo esc_html( self::verified_message( get_post_meta( $variation->ID, self::STYLE_NO, true ), $style_id, $style_name ) );
 			}
 			?>
 		</div>
@@ -178,7 +189,7 @@ class Codemas_Ewand_Product_Fields {
 		$url          = (string) Codemas_Ewand_Settings::get( 'verify_url' );
 
 		if ( '' === $url ) {
-			wp_send_json_error( array( 'message' => __( 'Set the Style verify URL in WooCommerce → ERP Sync.', 'codemas-ewand-ordersync' ) ) );
+			wp_send_json_error( array( 'message' => __( 'Set the Style verify URL in Ewand Sync → Settings.', 'codemas-ewand-ordersync' ) ) );
 		}
 		if ( '' === $style_no ) {
 			wp_send_json_error( array( 'message' => __( 'Enter the Ewand Style No first.', 'codemas-ewand-ordersync' ) ) );
@@ -200,8 +211,7 @@ class Codemas_Ewand_Product_Fields {
 		} );
 		$style = $matches[0];
 
-		/* translators: 1: style number, 2: Ewand style ID, 3: style name */
-		$message = sprintf( __( 'Verified: %1$s = Ewand style #%2$s (%3$s)', 'codemas-ewand-ordersync' ), $style['code'], $style['id'], $style['name'] ?? '' );
+		$message = self::verified_message( $style['code'], $style['id'], $style['name'] ?? '' );
 		if ( 'active' !== ( $style['status'] ?? '' ) ) {
 			/* translators: %s: Ewand style status */
 			$message .= ' – ' . sprintf( __( 'status: %s', 'codemas-ewand-ordersync' ), $style['status'] ?? '?' );
@@ -215,11 +225,13 @@ class Codemas_Ewand_Product_Fields {
 		if ( $variation && $variation->is_type( 'variation' ) ) {
 			$variation->update_meta_data( self::STYLE_NO, $style_no );
 			$variation->update_meta_data( self::STYLE_ID, (string) absint( $style['id'] ) );
+			$variation->update_meta_data( self::STYLE_NAME, sanitize_text_field( (string) ( $style['name'] ?? '' ) ) );
 			$variation->save_meta_data();
 		}
 
 		wp_send_json_success( array(
 			'id'      => (int) $style['id'],
+			'name'    => (string) ( $style['name'] ?? '' ),
 			'message' => $message,
 		) );
 	}
@@ -272,7 +284,9 @@ class Codemas_Ewand_Product_Fields {
 		$variation = wc_get_product( $variation_id );
 		if ( $variation ) {
 			$variation->update_meta_data( self::STYLE_NO, sanitize_text_field( wp_unslash( $_POST['ce_variation_style_no'][ $loop ] ?? '' ) ) );
-			$variation->update_meta_data( self::STYLE_ID, self::sanitize_id( $_POST['ce_variation_style_id'][ $loop ] ?? '' ) );
+			$style_id = self::sanitize_id( $_POST['ce_variation_style_id'][ $loop ] ?? '' );
+			$variation->update_meta_data( self::STYLE_ID, $style_id );
+			$variation->update_meta_data( self::STYLE_NAME, '' === $style_id ? '' : sanitize_text_field( wp_unslash( $_POST['ce_variation_style_name'][ $loop ] ?? '' ) ) );
 			$variation->save_meta_data();
 		}
 		// phpcs:enable
@@ -323,6 +337,7 @@ class Codemas_Ewand_Product_Fields {
 					}).done(function(r){
 						if (r && r.success) {
 							row.find('.ce-style-id').val(r.data.id);
+							row.find('.ce-style-name').val(r.data.name || '');
 							show(row, 'ok', r.data.message);
 						} else {
 							show(row, 'bad', r && r.data && r.data.message ? r.data.message : txt.unexpected);
@@ -333,7 +348,7 @@ class Codemas_Ewand_Product_Fields {
 				});
 				box.on('input', '.ce-style-no', function(){
 					var row = $(this).closest('.woocommerce_variation');
-					row.find('.ce-style-id').val('');
+					row.find('.ce-style-id, .ce-style-name').val('');
 					show(row, '', '');
 				});
 			});

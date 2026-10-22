@@ -35,10 +35,12 @@ add_action( 'plugins_loaded', function () {
 	require_once CODEMAS_EWAND_DIR . 'includes/class-product-fields.php';
 	require_once CODEMAS_EWAND_DIR . 'includes/class-payload.php';
 	require_once CODEMAS_EWAND_DIR . 'includes/class-sender.php';
+	require_once CODEMAS_EWAND_DIR . 'includes/class-orders-page.php';
 
 	Codemas_Ewand_Settings::init();
 	Codemas_Ewand_Product_Fields::init();
 	Codemas_Ewand_Sender::init();
+	Codemas_Ewand_Orders_Page::init();
 } );
 
 /* Settings link on the Plugins screen */

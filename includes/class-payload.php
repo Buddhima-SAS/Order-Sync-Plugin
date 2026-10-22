@@ -45,6 +45,15 @@ class Codemas_Ewand_Payload {
 		$billing_name  = trim( $order->get_billing_first_name() . ' ' . $order->get_billing_last_name() );
 		$shipping_name = trim( $order->get_shipping_first_name() . ' ' . $order->get_shipping_last_name() );
 		$agent_id      = self::int_or_null( $s['agent_id'] );
+		$shipping      = self::shipping_method( $order );
+		$region_id     = Codemas_Ewand_Settings::region_id( $shipping ? $shipping->get_instance_id() : 0 );
+
+		if ( null === $region_id ) {
+			/* translators: %s: shipping method */
+			$problems[] = $shipping
+				? sprintf( 'Ewand shipping region ID is not set for the shipping method "%s".', $shipping->get_name() )
+				: 'The order has no shipping method and no default Ewand shipping region ID is set.';
+		}
 
 		foreach ( array(
 			'Factory ID'         => $s['factory_id'],
@@ -57,6 +66,7 @@ class Codemas_Ewand_Payload {
 
 		return array(
 			'factory_id'          => self::int_or_null( $s['factory_id'] ),
+			'customer_id'         => self::int_or_null( $s['customer_id'] ),
 			'customer_email'      => $order->get_billing_email(),
 			'delivery_date'       => $delivery,
 			'production_type'     => $s['production_type'],
@@ -66,7 +76,8 @@ class Codemas_Ewand_Payload {
 			'sales_agent_id'      => $agent_id,
 			'customer_service_id' => $agent_id,
 			'account_manager_id'  => $agent_id,
-			'shipping_region'     => self::region( $order ),
+			'shipping_region_id'  => $region_id,
+			'shipping_region'     => $shipping ? $shipping->get_name() : '',
 			'shipping_type'       => strtolower( $s['ship_mode'] ),
 			'no_of_boxes'         => max( 1, (int) $s['no_of_boxes'] ),
 			'customer_order_ref'  => (string) $order->get_order_number(),
@@ -309,18 +320,10 @@ class Codemas_Ewand_Payload {
 	}
 
 	/**
-	 * Region picked at checkout ("Auckland"), from the same address as the
-	 * delivery address. Falls back to the raw value for countries without a region list.
+	 * Shipping method chosen at checkout ("Auckland Rural"), the order's first shipping line.
 	 */
-	private static function region( WC_Order $order ) {
-		$type    = $order->has_shipping_address() ? 'shipping' : 'billing';
-		$code    = $order->{"get_{$type}_state"}();
-		$country = $order->{"get_{$type}_country"}();
-		if ( '' === (string) $code ) {
-			return '';
-		}
-		$states = WC()->countries->get_states( $country );
-		$name   = is_array( $states ) && isset( $states[ $code ] ) ? $states[ $code ] : $code;
-		return html_entity_decode( $name, ENT_QUOTES, 'UTF-8' );
+	private static function shipping_method( WC_Order $order ) {
+		$lines = $order->get_items( 'shipping' );
+		return $lines ? reset( $lines ) : null;
 	}
 }

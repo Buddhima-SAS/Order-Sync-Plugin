@@ -1,6 +1,7 @@
 <?php
 /**
- * Queues and sends orders to the ERP endpoint.
+ * Sends orders to the ERP endpoint. Sending is always manual (Ewand Sync → Orders,
+ * or the "Send to ERP" order action) and each order is sent at most once.
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -9,22 +10,11 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class Codemas_Ewand_Sender {
 
-	const HOOK        = 'codemas_ewand_send_order';
-	const GROUP       = 'codemas-ewand';
-	const LOG_SOURCE  = 'codemas-ewand';
-	const MAX_RETRIES = 5;
-	const KICK_ACTION = 'codemas_ewand_kick';
+	const LOG_SOURCE = 'codemas-ewand';
 
-	/**
-	 * Delay before the first send. CODEMAS switches half-payment orders from
-	 * "processing" to "partially-paid" on the thank-you page, so wait for the
-	 * status to settle and send the final state once. Kept short: the queue
-	 * itself only runs about once a minute.
-	 */
-	const SEND_DELAY = 10;
-
-	/* Seconds to wait before retry 1..5 */
-	const BACKOFF = array( 60, 300, 1800, 7200, 21600 );
+	/* Background queue used by earlier versions (auto-send); leftover actions are removed */
+	const HOOK  = 'codemas_ewand_send_order';
+	const GROUP = 'codemas-ewand';
 
 	const META_SYNCED_AT = '_codemas_ewand_synced_at';
 	const META_EVENT     = '_codemas_ewand_last_event';
@@ -34,172 +24,83 @@ class Codemas_Ewand_Sender {
 	const META_RESPONSE  = '_codemas_ewand_last_response';
 	const META_TRIED_AT  = '_codemas_ewand_last_attempt_at';
 
-	public static function init() {
-		add_action( 'woocommerce_order_status_changed', array( __CLASS__, 'on_status_changed' ), 20, 4 );
-		add_action( self::HOOK, array( __CLASS__, 'process' ), 10, 1 );
-		add_action( 'wp_ajax_' . self::KICK_ACTION, array( __CLASS__, 'kick' ) );
-		add_action( 'wp_ajax_nopriv_' . self::KICK_ACTION, array( __CLASS__, 'kick' ) );
+	/* Seconds after which a send lock is treated as abandoned (longer than the max HTTP timeout) */
+	const LOCK_TTL = 300;
 
+	public static function init() {
+		add_action( 'admin_init', array( __CLASS__, 'clear_old_queue' ) );
 		add_filter( 'woocommerce_order_actions', array( __CLASS__, 'add_order_action' ), 10, 2 );
 		add_action( 'woocommerce_order_action_codemas_ewand_send', array( __CLASS__, 'manual_send' ) );
 		add_action( 'add_meta_boxes', array( __CLASS__, 'add_meta_box' ) );
 	}
 
-	public static function on_status_changed( $order_id, $old_status, $new_status, $order ) {
-		if ( ! Codemas_Ewand_Settings::is_active() ) {
+	/**
+	 * Once: cancel automatic sends/retries still queued by the old auto-send.
+	 */
+	public static function clear_old_queue() {
+		if ( get_option( 'codemas_ewand_queue_cleared' ) || ! function_exists( 'as_unschedule_all_actions' ) ) {
 			return;
 		}
-		if ( ! in_array( $new_status, (array) Codemas_Ewand_Settings::get( 'statuses' ), true ) ) {
-			return;
-		}
-		if ( $order instanceof WC_Order && 'shop_order' !== $order->get_type() ) {
-			return; // Skip refunds etc.
-		}
-
-		self::schedule( $order_id, self::SEND_DELAY );
-		self::request_kick( $order_id );
+		as_unschedule_all_actions( self::HOOK, array(), self::GROUP );
+		update_option( 'codemas_ewand_queue_cleared', 1, false );
 	}
 
 	/**
-	 * The queue only runs when WP-Cron does, which on a quiet site can be
-	 * minutes away. Fire a background request to this site that runs the queued
-	 * send as soon as it is due. If the request fails, the queue still sends it.
+	 * POST the order to the ERP – once. The ERP creates a new order on every POST,
+	 * so an order that was sent successfully is never sent again, and a lock stops
+	 * two sends of the same order (queue + button, double click) running together.
+	 *
+	 * @return true|null|WP_Error True on success, null if already sent, WP_Error on failure.
 	 */
-	private static function request_kick( $order_id ) {
-		static $requested = array();
-		if ( isset( $requested[ $order_id ] ) ) {
-			return;
-		}
-		$requested[ $order_id ] = true;
-
-		add_action( 'shutdown', function () use ( $order_id ) {
-			wp_remote_post( admin_url( 'admin-ajax.php' ), array(
-				'timeout'   => 0.01,
-				'blocking'  => false,
-				'sslverify' => apply_filters( 'https_local_ssl_verify', false ),
-				'body'      => array(
-					'action'   => self::KICK_ACTION,
-					'order_id' => (int) $order_id,
-					'key'      => self::kick_key( $order_id ),
-				),
-			) );
-		} );
-	}
-
-	private static function kick_key( $order_id ) {
-		return wp_hash( self::KICK_ACTION . '|' . (int) $order_id );
-	}
-
-	/**
-	 * Background request from request_kick(): wait out the send delay, then run
-	 * this order's pending send.
-	 */
-	public static function kick() {
-		$order_id = absint( $_POST['order_id'] ?? 0 );
-		$key      = sanitize_text_field( wp_unslash( $_POST['key'] ?? '' ) );
-		if ( ! $order_id || ! hash_equals( self::kick_key( $order_id ), $key ) ) {
-			wp_die( '', '', array( 'response' => 403 ) );
+	public static function send( WC_Order $order ) {
+		$order_id = $order->get_id();
+		if ( ! self::lock( $order_id ) ) {
+			return new WP_Error( 'codemas_ewand_busy', __( 'This order is being sent right now – check again in a minute.', 'codemas-ewand-ordersync' ) );
 		}
 
-		ignore_user_abort( true );
-		if ( function_exists( 'fastcgi_finish_request' ) ) {
-			fastcgi_finish_request();
-		}
-		sleep( self::SEND_DELAY + 1 );
-
-		$pending = as_get_scheduled_actions( array(
-			'hook'     => self::HOOK,
-			'args'     => array( $order_id ),
-			'group'    => self::GROUP,
-			'status'   => ActionScheduler_Store::STATUS_PENDING,
-			'per_page' => 1,
-		), 'ids' );
-		foreach ( $pending as $action_id ) {
-			ActionScheduler_QueueRunner::instance()->process_action( $action_id, 'Codemas Ewand' );
-		}
-		wp_die();
-	}
-
-	/**
-	 * Queue a send unless one is already pending for this order (the pending one
-	 * will pick up the latest order state when it runs).
-	 */
-	public static function schedule( $order_id, $delay ) {
-		$args    = array( (int) $order_id );
-		$pending = as_get_scheduled_actions( array(
-			'hook'     => self::HOOK,
-			'args'     => $args,
-			'group'    => self::GROUP,
-			'status'   => ActionScheduler_Store::STATUS_PENDING,
-			'per_page' => 1,
-		), 'ids' );
-		if ( $pending ) {
-			return;
-		}
-		as_schedule_single_action( time() + (int) $delay, self::HOOK, $args, self::GROUP );
-	}
-
-	/**
-	 * Action Scheduler callback.
-	 */
-	public static function process( $order_id ) {
-		$order = wc_get_order( $order_id );
-		if ( ! $order || ! Codemas_Ewand_Settings::is_active() ) {
-			return;
-		}
-
-		$result = self::send( $order, false );
-
-		if ( is_wp_error( $result ) && 'codemas_ewand_invalid' === $result->get_error_code() ) {
-			// Retrying won't help until the missing IDs are filled in.
-			$order->add_order_note( sprintf(
-				/* translators: %s: reasons */
-				__( 'Not sent to ERP: %s Fix this, then use "Send to ERP" in Order actions.', 'codemas-ewand-ordersync' ),
-				$result->get_error_message()
-			) );
-		} elseif ( is_wp_error( $result ) ) {
-			$attempts = (int) $order->get_meta( self::META_ATTEMPTS ) + 1;
-			$order->update_meta_data( self::META_ATTEMPTS, $attempts );
-			$order->save_meta_data();
-
-			if ( $attempts <= self::MAX_RETRIES ) {
-				$delay = self::BACKOFF[ $attempts - 1 ];
-				self::schedule( $order_id, $delay );
-				$order->add_order_note( sprintf(
-					/* translators: 1: error 2: attempt 3: max 4: minutes */
-					__( 'ERP sync failed: %1$s. Retry %2$d of %3$d in %4$d min.', 'codemas-ewand-ordersync' ),
-					$result->get_error_message(), $attempts, self::MAX_RETRIES, $delay / 60
-				) );
-			} else {
-				$order->add_order_note( sprintf(
-					/* translators: %s: error */
-					__( 'ERP sync failed permanently: %s. Use "Send to ERP" in Order actions to retry.', 'codemas-ewand-ordersync' ),
-					$result->get_error_message()
-				) );
+		try {
+			// Re-read: another request may have sent it since this order object was loaded.
+			$fresh = wc_get_order( $order_id );
+			if ( ! $fresh || $fresh->get_meta( self::META_SYNCED_AT ) ) {
+				return null;
 			}
+			return self::do_send( $fresh );
+		} finally {
+			self::unlock( $order_id );
 		}
 	}
 
-	/**
-	 * POST the order to the ERP.
-	 *
-	 * The ERP creates a new order on every POST, so an order is only sent
-	 * automatically once; later status changes don't send it again.
-	 *
-	 * @param bool $force Send even if it was sent before ("Send to ERP" order action).
-	 * @return true|null|WP_Error True on success, null if skipped, WP_Error on failure.
-	 */
-	public static function send( WC_Order $order, $force = false ) {
-		if ( ! $force && $order->get_meta( self::META_SYNCED_AT ) ) {
-			return null;
-		}
+	private static function lock_key( $order_id ) {
+		return 'codemas_ewand_lock_' . (int) $order_id;
+	}
 
+	/**
+	 * add_option() only succeeds for one request (unique option name), so it works as a lock.
+	 */
+	private static function lock( $order_id ) {
+		$key = self::lock_key( $order_id );
+		if ( add_option( $key, time(), '', 'no' ) ) {
+			return true;
+		}
+		wp_cache_delete( $key, 'options' );
+		if ( (int) get_option( $key ) < time() - self::LOCK_TTL ) {
+			delete_option( $key );
+			return add_option( $key, time(), '', 'no' );
+		}
+		return false;
+	}
+
+	private static function unlock( $order_id ) {
+		delete_option( self::lock_key( $order_id ) );
+	}
+
+	private static function do_send( WC_Order $order ) {
 		$problems = Codemas_Ewand_Payload::problems( $order );
 		if ( $problems ) {
 			return new WP_Error( 'codemas_ewand_invalid', implode( ' ', $problems ) );
 		}
 
-		$event   = $order->get_meta( self::META_SYNCED_AT ) ? 'order.resent' : 'order.created';
+		$event   = 'order.created';
 		$payload = Codemas_Ewand_Payload::build( $order );
 		$json    = wp_json_encode( $payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
 
@@ -214,6 +115,7 @@ class Codemas_Ewand_Sender {
 
 		if ( is_wp_error( $result ) ) {
 			$order->update_meta_data( self::META_RESPONSE, $result->get_error_message() );
+			$order->update_meta_data( self::META_ATTEMPTS, (int) $order->get_meta( self::META_ATTEMPTS ) + 1 );
 			$order->save_meta_data();
 			$logger->error( sprintf( 'Order #%d %s failed: %s', $order->get_id(), $event, $result->get_error_message() ), $context );
 			return $result;
@@ -226,12 +128,19 @@ class Codemas_Ewand_Sender {
 		$order->update_meta_data( self::META_RESPONSE, substr( $body, 0, 2048 ) );
 
 		if ( $code < 200 || $code >= 300 ) {
+			$order->update_meta_data( self::META_ATTEMPTS, (int) $order->get_meta( self::META_ATTEMPTS ) + 1 );
 			$order->save_meta_data();
 			$logger->error( sprintf( 'Order #%d %s failed: HTTP %d %s', $order->get_id(), $event, $code, substr( $body, 0, 500 ) ), $context );
 			$message = in_array( $code, array( 401, 403 ), true )
 				? sprintf( 'HTTP %d – check Bearer token', $code )
 				: sprintf( 'HTTP %d', $code );
-			return new WP_Error( 'codemas_ewand_http', $message );
+			$detail  = self::error_detail( $body );
+			if ( '' !== $detail ) {
+				$message .= ' – ' . $detail;
+			}
+			// Validation errors (422 etc.) fail the same way on every retry.
+			$rejected = $code >= 400 && $code < 500 && ! in_array( $code, array( 401, 403, 408, 429 ), true );
+			return new WP_Error( $rejected ? 'codemas_ewand_rejected' : 'codemas_ewand_http', $message );
 		}
 
 		$order->update_meta_data( self::META_SYNCED_AT, current_time( 'mysql' ) );
@@ -249,6 +158,24 @@ class Codemas_Ewand_Sender {
 		do_action( 'codemas_ewand_order_sent', $order, $payload, $result );
 
 		return true;
+	}
+
+	/**
+	 * Readable error from an ERP JSON error body: every validation error, else its message.
+	 */
+	public static function error_detail( $body ) {
+		$json = json_decode( (string) $body, true );
+		if ( ! is_array( $json ) ) {
+			return '';
+		}
+		if ( ! empty( $json['errors'] ) && is_array( $json['errors'] ) ) {
+			$errors = array();
+			array_walk_recursive( $json['errors'], function ( $e ) use ( &$errors ) {
+				$errors[] = (string) $e;
+			} );
+			return implode( ' ', array_unique( $errors ) );
+		}
+		return is_string( $json['message'] ?? null ) ? $json['message'] : '';
 	}
 
 	/**
@@ -357,15 +284,17 @@ class Codemas_Ewand_Sender {
 	}
 
 	public static function add_order_action( $actions, $order = null ) {
-		if ( Codemas_Ewand_Settings::is_active() ) {
+		if ( Codemas_Ewand_Settings::is_active() && ! ( $order instanceof WC_Order && $order->get_meta( self::META_SYNCED_AT ) ) ) {
 			$actions['codemas_ewand_send'] = __( 'Send to ERP', 'codemas-ewand-ordersync' );
 		}
 		return $actions;
 	}
 
 	public static function manual_send( $order ) {
-		$result = self::send( $order, true );
-		if ( is_wp_error( $result ) ) {
+		$result = self::send( $order );
+		if ( null === $result ) {
+			$order->add_order_note( __( 'Already sent to ERP – not sent again (each send creates a new ERP order).', 'codemas-ewand-ordersync' ) );
+		} elseif ( is_wp_error( $result ) ) {
 			$order->add_order_note( sprintf(
 				/* translators: %s: error */
 				__( 'Manual ERP send failed: %s', 'codemas-ewand-ordersync' ),

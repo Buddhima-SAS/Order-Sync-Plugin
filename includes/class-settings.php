@@ -1,6 +1,6 @@
 <?php
 /**
- * Settings page: WooCommerce → ERP Sync
+ * Settings page: Ewand Sync → Settings
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -13,7 +13,7 @@ class Codemas_Ewand_Settings {
 	const PAGE   = 'codemas-ewand-ordersync';
 
 	public static function init() {
-		add_action( 'admin_menu', array( __CLASS__, 'add_menu' ), 60 );
+		add_action( 'admin_menu', array( __CLASS__, 'add_menu' ), 60 ); // After Codemas_Ewand_Orders_Page creates the menu.
 		add_action( 'admin_init', array( __CLASS__, 'register' ) );
 	}
 
@@ -26,11 +26,13 @@ class Codemas_Ewand_Settings {
 			'header_name'  => '',
 			'header_value' => '',
 			'timeout'      => 15,
-			'statuses'     => array( 'processing', 'completed' ),
 			// Production Order defaults for this website.
 			'site_code'         => '',
 			'factory_id'        => '',
 			'agent_id'          => '',
+			'customer_id'       => '',
+			'region_ids'        => array(),
+			'default_region_id' => '1', // Until regions are matched to Ewand IDs.
 			'production_type'   => 'make',
 			'ship_mode'         => 'SEA',
 			'no_of_boxes'       => 1,
@@ -55,6 +57,20 @@ class Codemas_Ewand_Settings {
 		return $map;
 	}
 
+	/**
+	 * Ewand shipping region ID for a shipping method instance (the method chosen
+	 * on the order), then the default. Null when none is set.
+	 */
+	public static function region_id( $instance_id ) {
+		foreach ( (array) self::get( 'region_ids' ) as $row ) {
+			if ( isset( $row['method'] ) && (int) $row['method'] === (int) $instance_id ) {
+				return (int) $row['id'];
+			}
+		}
+		$default = self::get( 'default_region_id' );
+		return '' === (string) $default ? null : (int) $default;
+	}
+
 	public static function get( $key = null ) {
 		$settings = wp_parse_args( (array) get_option( self::OPTION, array() ), self::defaults() );
 		return null === $key ? $settings : ( $settings[ $key ] ?? null );
@@ -65,10 +81,9 @@ class Codemas_Ewand_Settings {
 	}
 
 	public static function add_menu() {
-		add_submenu_page(
-			'woocommerce',
+		Codemas_Ewand_Orders_Page::add_page(
 			__( 'ERP Sync', 'codemas-ewand-ordersync' ),
-			__( 'ERP Sync', 'codemas-ewand-ordersync' ),
+			__( 'Settings', 'codemas-ewand-ordersync' ),
 			'manage_woocommerce',
 			self::PAGE,
 			array( __CLASS__, 'render' )
@@ -85,8 +100,6 @@ class Codemas_Ewand_Settings {
 
 	public static function sanitize( $input ) {
 		$input      = (array) $input;
-		$valid      = array_map( fn( $s ) => str_replace( 'wc-', '', $s ), array_keys( wc_get_order_statuses() ) );
-		$statuses   = array_map( 'sanitize_key', (array) ( $input['statuses'] ?? array() ) );
 
 		// Blank field keeps the saved token (the field is never pre-filled); the checkbox clears it.
 		$token = trim( sanitize_text_field( $input['bearer_token'] ?? '' ) );
@@ -103,10 +116,12 @@ class Codemas_Ewand_Settings {
 			'header_name'  => preg_replace( '/[^A-Za-z0-9\-]/', '', $input['header_name'] ?? '' ),
 			'header_value' => sanitize_text_field( $input['header_value'] ?? '' ),
 			'timeout'      => max( 5, min( 60, absint( $input['timeout'] ?? 15 ) ) ),
-			'statuses'     => array_values( array_intersect( $statuses, $valid ) ),
 			'site_code'         => strtoupper( preg_replace( '/[^A-Za-z0-9\-]/', '', $input['site_code'] ?? '' ) ),
 			'factory_id'        => self::id( $input['factory_id'] ?? '' ),
 			'agent_id'          => self::id( $input['agent_id'] ?? '' ),
+			'customer_id'       => self::id( $input['customer_id'] ?? '' ),
+			'region_ids'        => self::sanitize_regions( $input['region_ids'] ?? array() ),
+			'default_region_id' => self::id( $input['default_region_id'] ?? '' ),
 			'production_type'   => sanitize_key( $input['production_type'] ?? 'make' ) ?: 'make',
 			'ship_mode'         => in_array( $input['ship_mode'] ?? '', array( 'AIR', 'SEA' ), true ) ? $input['ship_mode'] : 'SEA',
 			'no_of_boxes'       => max( 1, absint( $input['no_of_boxes'] ?? 1 ) ),
@@ -115,6 +130,21 @@ class Codemas_Ewand_Settings {
 			'size_attribute'    => sanitize_title( $input['size_attribute'] ?? 'pa_size' ),
 			'size_map'          => sanitize_textarea_field( $input['size_map'] ?? '' ),
 		);
+	}
+
+	/**
+	 * Shipping method rows with an ID: [ {method, id} ], one per shipping method instance.
+	 */
+	private static function sanitize_regions( $rows ) {
+		$clean = array();
+		foreach ( (array) $rows as $row ) {
+			$method = absint( $row['method'] ?? 0 );
+			$id     = self::id( $row['id'] ?? '' );
+			if ( $method && '' !== $id && '0' !== $id ) {
+				$clean[ $method ] = array( 'method' => $method, 'id' => $id );
+			}
+		}
+		return array_values( $clean );
 	}
 
 	/**
@@ -141,14 +171,14 @@ class Codemas_Ewand_Settings {
 		?>
 		<div class="wrap">
 			<h1><?php esc_html_e( 'Codemas Ewand OrderSync – ERP Sync', 'codemas-ewand-ordersync' ); ?></h1>
-			<p><?php esc_html_e( 'Paid orders are sent as JSON (HTTP POST) to the ERP endpoint below. Delivery runs in the background and failed sends are retried automatically.', 'codemas-ewand-ordersync' ); ?></p>
+			<p><?php esc_html_e( 'Orders are sent as JSON (HTTP POST) to the ERP endpoint below – only when you send them from Ewand Sync → Orders (single or bulk). Nothing is sent automatically, and each order is sent only once.', 'codemas-ewand-ordersync' ); ?></p>
 
 			<form method="post" action="options.php">
 				<?php settings_fields( self::PAGE ); ?>
 				<table class="form-table" role="presentation">
 					<tr>
 						<th scope="row"><?php esc_html_e( 'Enable', 'codemas-ewand-ordersync' ); ?></th>
-						<td><label><input type="checkbox" name="<?php echo esc_attr( $o ); ?>[enabled]" value="yes" <?php checked( $s['enabled'], 'yes' ); ?>> <?php esc_html_e( 'Send orders to the ERP', 'codemas-ewand-ordersync' ); ?></label></td>
+						<td><label><input type="checkbox" name="<?php echo esc_attr( $o ); ?>[enabled]" value="yes" <?php checked( $s['enabled'], 'yes' ); ?>> <?php esc_html_e( 'Allow sending orders to the ERP', 'codemas-ewand-ordersync' ); ?></label></td>
 					</tr>
 					<tr>
 						<th scope="row"><label for="ce-endpoint"><?php esc_html_e( 'ERP endpoint URL', 'codemas-ewand-ordersync' ); ?></label></th>
@@ -182,15 +212,6 @@ class Codemas_Ewand_Settings {
 						<th scope="row"><label for="ce-timeout"><?php esc_html_e( 'Timeout (seconds)', 'codemas-ewand-ordersync' ); ?></label></th>
 						<td><input type="number" id="ce-timeout" min="5" max="60" name="<?php echo esc_attr( $o ); ?>[timeout]" value="<?php echo esc_attr( $s['timeout'] ); ?>"></td>
 					</tr>
-					<tr>
-						<th scope="row"><?php esc_html_e( 'Send when order status becomes', 'codemas-ewand-ordersync' ); ?></th>
-						<td>
-							<?php foreach ( wc_get_order_statuses() as $key => $label ) :
-								$slug = str_replace( 'wc-', '', $key ); ?>
-								<label style="display:block"><input type="checkbox" name="<?php echo esc_attr( $o ); ?>[statuses][]" value="<?php echo esc_attr( $slug ); ?>" <?php checked( in_array( $slug, $s['statuses'], true ) ); ?>> <?php echo esc_html( $label ); ?></label>
-							<?php endforeach; ?>
-						</td>
-					</tr>
 				</table>
 
 				<h2><?php esc_html_e( 'Production Order defaults (this website)', 'codemas-ewand-ordersync' ); ?></h2>
@@ -209,6 +230,15 @@ class Codemas_Ewand_Settings {
 						<th scope="row"><label for="ce-agent"><?php esc_html_e( 'AI Agent user ID', 'codemas-ewand-ordersync' ); ?></label></th>
 						<td><input type="number" id="ce-agent" min="1" name="<?php echo esc_attr( $o ); ?>[agent_id]" value="<?php echo esc_attr( $s['agent_id'] ); ?>" style="width:120px">
 							<p class="description"><?php esc_html_e( 'ID of the "AI Agent" user in Ewand. Sent as Sales Agent, Customer Service and Account Manager.', 'codemas-ewand-ordersync' ); ?></p></td>
+					</tr>
+					<tr>
+						<th scope="row"><label for="ce-customer"><?php esc_html_e( 'Default Ewand customer ID', 'codemas-ewand-ordersync' ); ?></label></th>
+						<td><input type="number" id="ce-customer" min="1" name="<?php echo esc_attr( $o ); ?>[customer_id]" value="<?php echo esc_attr( $s['customer_id'] ); ?>" style="width:120px">
+							<p class="description"><?php esc_html_e( 'Sent as customer_id on every order, together with the customer\'s email (Ewand matches the real customer by email). Use a placeholder customer in Ewand such as "Web Orders". Leave blank to send none.', 'codemas-ewand-ordersync' ); ?></p></td>
+					</tr>
+					<tr>
+						<th scope="row"><?php esc_html_e( 'Shipping region IDs', 'codemas-ewand-ordersync' ); ?></th>
+						<td><?php self::render_regions( $s ); ?></td>
 					</tr>
 					<tr>
 						<th scope="row"><label for="ce-team"><?php esc_html_e( 'Team/Club Name', 'codemas-ewand-ordersync' ); ?></label></th>
@@ -260,14 +290,67 @@ class Codemas_Ewand_Settings {
 			<p>
 				<?php
 				printf(
-					/* translators: 1: scheduled actions link 2: logs link */
-					esc_html__( 'Delivery queue: %1$s · Logs: %2$s (source "codemas-ewand"). Each order also gets an order note after every send.', 'codemas-ewand-ordersync' ),
-					'<a href="' . esc_url( admin_url( 'admin.php?page=wc-status&tab=action-scheduler&s=codemas_ewand' ) ) . '">' . esc_html__( 'Scheduled Actions', 'codemas-ewand-ordersync' ) . '</a>',
+					/* translators: %s: logs link */
+					esc_html__( 'Logs: %s (source "codemas-ewand"). Each order also gets an order note after every send.', 'codemas-ewand-ordersync' ),
 					'<a href="' . esc_url( admin_url( 'admin.php?page=wc-status&tab=logs&source=codemas-ewand' ) ) . '">' . esc_html__( 'WooCommerce Logs', 'codemas-ewand-ordersync' ) . '</a>'
 				);
 				?>
 			</p>
 		</div>
+		<?php
+	}
+
+	/**
+	 * Shipping method → Ewand shipping region ID table. Lists every method of
+	 * every shipping zone (WooCommerce → Settings → Shipping).
+	 */
+	private static function render_regions( array $s ) {
+		$o   = self::OPTION;
+		$ids = array();
+		foreach ( (array) $s['region_ids'] as $row ) {
+			if ( isset( $row['method'] ) ) {
+				$ids[ (int) $row['method'] ] = $row['id'];
+			}
+		}
+
+		$zones = array();
+		foreach ( WC_Shipping_Zones::get_zones() as $zone ) {
+			$zones[] = new WC_Shipping_Zone( $zone['id'] );
+		}
+		$zones[] = new WC_Shipping_Zone( 0 ); // Rest of the world.
+		?>
+		<table class="widefat striped ce-regions" style="max-width:720px">
+			<thead><tr>
+				<th><?php esc_html_e( 'Zone', 'codemas-ewand-ordersync' ); ?></th>
+				<th><?php esc_html_e( 'Shipping method', 'codemas-ewand-ordersync' ); ?></th>
+				<th style="width:170px"><?php esc_html_e( 'Ewand region ID', 'codemas-ewand-ordersync' ); ?></th>
+			</tr></thead>
+			<tbody>
+				<?php
+				$i = 0;
+				foreach ( $zones as $zone ) :
+					foreach ( $zone->get_shipping_methods() as $method ) :
+						$n = $o . '[region_ids][' . $i++ . ']';
+						?>
+						<tr>
+							<td><?php echo esc_html( $zone->get_zone_name() ); ?></td>
+							<td><?php echo esc_html( $method->get_title() ); ?>
+								<?php if ( ! $method->is_enabled() ) : ?><em>(<?php esc_html_e( 'disabled', 'codemas-ewand-ordersync' ); ?>)</em><?php endif; ?>
+								<input type="hidden" name="<?php echo esc_attr( $n ); ?>[method]" value="<?php echo esc_attr( $method->get_instance_id() ); ?>"></td>
+							<td><input type="number" min="1" name="<?php echo esc_attr( $n ); ?>[id]" value="<?php echo esc_attr( $ids[ $method->get_instance_id() ] ?? '' ); ?>" style="width:120px"></td>
+						</tr>
+					<?php endforeach;
+				endforeach;
+				if ( ! $i ) : ?>
+					<tr><td colspan="3"><?php esc_html_e( 'No shipping methods set up in WooCommerce → Settings → Shipping.', 'codemas-ewand-ordersync' ); ?></td></tr>
+				<?php endif; ?>
+			</tbody>
+		</table>
+		<p>
+			<label for="ce-default-region"><?php esc_html_e( 'Default region ID', 'codemas-ewand-ordersync' ); ?></label>
+			<input type="number" id="ce-default-region" min="1" name="<?php echo esc_attr( $o ); ?>[default_region_id]" value="<?php echo esc_attr( $s['default_region_id'] ); ?>" style="width:120px">
+		</p>
+		<p class="description"><?php esc_html_e( 'Sent as shipping_region_id, picked from the shipping method chosen on the order (its title is sent as shipping_region), then the default. Orders with no match are held as "Not ready". Empty rows are ignored.', 'codemas-ewand-ordersync' ); ?></p>
 		<?php
 	}
 
@@ -295,8 +378,8 @@ class Codemas_Ewand_Settings {
 				<input type="number" name="order_id" value="<?php echo esc_attr( $order_id ); ?>" min="1" style="width:100px">
 			</label>
 			<button class="button" name="codemas_ewand_tool" value="preview"><?php esc_html_e( 'Preview JSON', 'codemas-ewand-ordersync' ); ?></button>
-			<button class="button button-primary" name="codemas_ewand_tool" value="test" <?php disabled( '' === self::get( 'endpoint' ) ); ?>><?php esc_html_e( 'Send test to ERP', 'codemas-ewand-ordersync' ); ?></button>
-			<p class="description"><?php esc_html_e( 'Preview shows the JSON without sending. "Send test" POSTs it to the ERP (this creates an order there) without changing the WooCommerce order.', 'codemas-ewand-ordersync' ); ?></p>
+			<button class="button button-primary" name="codemas_ewand_tool" value="test" <?php disabled( '' === self::get( 'endpoint' ) ); ?>><?php esc_html_e( 'Send to ERP', 'codemas-ewand-ordersync' ); ?></button>
+			<p class="description"><?php esc_html_e( 'Preview shows the JSON without sending. "Send to ERP" creates the order in the ERP and marks the WooCommerce order as sent – an order is only ever sent once.', 'codemas-ewand-ordersync' ); ?></p>
 		</form>
 		<?php
 		if ( ! $action ) {
@@ -316,19 +399,18 @@ class Codemas_Ewand_Settings {
 		}
 
 		if ( 'test' === $action ) {
-			$result = Codemas_Ewand_Sender::post( $payload );
-			if ( is_wp_error( $result ) ) {
+			$result = Codemas_Ewand_Sender::send( $order );
+			if ( null === $result ) {
+				echo '<div class="notice notice-warning inline"><p>' . esc_html__( 'Already sent to the ERP – not sent again.', 'codemas-ewand-ordersync' ) . '</p></div>';
+			} elseif ( is_wp_error( $result ) ) {
 				echo '<div class="notice notice-error inline"><p>' . esc_html( $result->get_error_message() ) . '</p></div>';
 			} else {
-				$ok = $result['code'] >= 200 && $result['code'] < 300;
-				printf(
-					'<div class="notice %s inline"><p><strong>HTTP %d</strong>%s</p></div>',
-					$ok ? 'notice-success' : 'notice-error',
-					(int) $result['code'],
-					in_array( $result['code'], array( 401, 403 ), true ) ? ' – ' . esc_html__( 'check the Bearer token.', 'codemas-ewand-ordersync' ) : ''
-				);
+				echo '<div class="notice notice-success inline"><p>' . esc_html__( 'Sent to the ERP.', 'codemas-ewand-ordersync' ) . '</p></div>';
+			}
+			$response = (string) wc_get_order( $order_id )->get_meta( Codemas_Ewand_Sender::META_RESPONSE );
+			if ( null !== $result && '' !== $response ) {
 				echo '<h3>' . esc_html__( 'ERP response', 'codemas-ewand-ordersync' ) . '</h3>';
-				echo '<pre style="background:#fff;border:1px solid #ccd0d4;padding:10px;max-height:200px;overflow:auto">' . esc_html( substr( $result['body'], 0, 2048 ) ) . '</pre>';
+				echo '<pre style="background:#fff;border:1px solid #ccd0d4;padding:10px;max-height:200px;overflow:auto">' . esc_html( $response ) . '</pre>';
 			}
 		}
 
