@@ -316,7 +316,7 @@ class Codemas_Ewand_Orders_Page {
 				// Use the filter fields as they are now (even if Filter wasn't clicked), so the dates shown are the dates sent.
 				var button = $(this), form = button.closest('form'), data = { action: 'ce_ewand_unsent_ids', nonce: cfg.nonce };
 				if (busy) { return; }
-				['order_status', 'date_from', 'date_to', 's'].forEach(function(k){ var v = form.find('[name="' + k + '"]').first().val(); if (v) { data[k] = v; } });
+				['date_from', 'date_to', 's'].forEach(function(k){ var v = form.find('[name="' + k + '"]').first().val(); if (v) { data[k] = v; } });
 				$.get(ajaxurl, data).done(function(r){
 					var ids = r && r.success ? r.data.ids : [];
 					if (!r || !r.success) { notice('error', r && r.data && r.data.message ? r.data.message : txt.failed); return; }
@@ -411,25 +411,25 @@ class Codemas_Ewand_Orders_Table extends WP_List_Table {
 	public static function filter_args() {
 		$args = array(
 			'type'    => 'shop_order',
+			'status'  => array( 'wc-processing' ), // Only Processing orders are listed and sent
 			'orderby' => 'date',
 			'order'   => 'DESC',
 		);
-
-		$status = sanitize_key( $_GET['order_status'] ?? '' );
-		if ( $status && array_key_exists( 'wc-' . $status, wc_get_order_statuses() ) ) {
-			$args['status'] = array( 'wc-' . $status );
-		}
 
 		$from = sanitize_text_field( wp_unslash( $_GET['date_from'] ?? '' ) );
 		$to   = sanitize_text_field( wp_unslash( $_GET['date_to'] ?? '' ) );
 		$from = preg_match( '/^\d{4}-\d{2}-\d{2}$/', $from ) ? $from : '';
 		$to   = preg_match( '/^\d{4}-\d{2}-\d{2}$/', $to ) ? $to : '';
-		if ( $from && $to ) {
-			$args['date_created'] = $from . '...' . $to;
-		} elseif ( $from ) {
-			$args['date_created'] = '>=' . $from;
-		} elseif ( $to ) {
-			$args['date_created'] = '<=' . $to;
+
+		// Never earlier than the plugin setup time; dates are in the site timezone
+		$start = (int) get_option( CODEMAS_EWAND_SETUP_OPTION, 0 );
+		if ( $from ) {
+			$start = max( $start, wc_string_to_datetime( $from . ' 00:00:00' )->getTimestamp() );
+		}
+		if ( $to ) {
+			$args['date_created'] = $start . '...' . wc_string_to_datetime( $to . ' 23:59:59' )->getTimestamp();
+		} elseif ( $start ) {
+			$args['date_created'] = '>=' . $start;
 		}
 
 		$search = trim( sanitize_text_field( wp_unslash( $_GET['s'] ?? '' ) ) );
@@ -459,7 +459,6 @@ class Codemas_Ewand_Orders_Table extends WP_List_Table {
 			'sent'     => __( 'Sent', 'codemas-ewand-ordersync' ),
 		);
 		$keep  = array_filter( array(
-			'order_status' => sanitize_key( $_GET['order_status'] ?? '' ),
 			'date_from'    => sanitize_text_field( wp_unslash( $_GET['date_from'] ?? '' ) ),
 			'date_to'      => sanitize_text_field( wp_unslash( $_GET['date_to'] ?? '' ) ),
 			's'            => sanitize_text_field( wp_unslash( $_GET['s'] ?? '' ) ),
@@ -481,27 +480,19 @@ class Codemas_Ewand_Orders_Table extends WP_List_Table {
 		if ( 'top' !== $which ) {
 			return;
 		}
-		$status = sanitize_key( $_GET['order_status'] ?? '' );
 		?>
 		<div class="alignleft actions ce-filters">
-			<select name="order_status">
-				<option value=""><?php esc_html_e( 'All statuses', 'codemas-ewand-ordersync' ); ?></option>
-				<?php foreach ( wc_get_order_statuses() as $key => $label ) :
-					$slug = str_replace( 'wc-', '', $key ); ?>
-					<option value="<?php echo esc_attr( $slug ); ?>" <?php selected( $status, $slug ); ?>><?php echo esc_html( $label ); ?></option>
-				<?php endforeach; ?>
-			</select>
 			<label class="screen-reader-text" for="ce-date-from"><?php esc_html_e( 'From', 'codemas-ewand-ordersync' ); ?></label>
 			<input type="date" id="ce-date-from" name="date_from" value="<?php echo esc_attr( sanitize_text_field( wp_unslash( $_GET['date_from'] ?? '' ) ) ); ?>" title="<?php esc_attr_e( 'From', 'codemas-ewand-ordersync' ); ?>">
 			<label class="screen-reader-text" for="ce-date-to"><?php esc_html_e( 'To', 'codemas-ewand-ordersync' ); ?></label>
 			<input type="date" id="ce-date-to" name="date_to" value="<?php echo esc_attr( sanitize_text_field( wp_unslash( $_GET['date_to'] ?? '' ) ) ); ?>" title="<?php esc_attr_e( 'To', 'codemas-ewand-ordersync' ); ?>">
 			<?php submit_button( __( 'Filter', 'codemas-ewand-ordersync' ), '', 'filter_action', false ); ?>
-			<?php if ( $status || ! empty( $_GET['date_from'] ) || ! empty( $_GET['date_to'] ) || ! empty( $_GET['s'] ) ) : ?>
+			<?php if ( ! empty( $_GET['date_from'] ) || ! empty( $_GET['date_to'] ) || ! empty( $_GET['s'] ) ) : ?>
 				<a class="button-link" href="<?php echo esc_url( Codemas_Ewand_Orders_Page::url( array( 'sync' => $this->view ) ) ); ?>"><?php esc_html_e( 'Clear', 'codemas-ewand-ordersync' ); ?></a>
 			<?php endif; ?>
 			<?php if ( Codemas_Ewand_Settings::is_active() ) :
 				$unsent = self::count( 'unsent' ); ?>
-				<button type="button" class="button button-primary ce-send-filtered" <?php disabled( 0, $unsent ); ?> title="<?php esc_attr_e( 'Sends every not-yet-sent order in the From–To dates (and status/search) entered, across all pages. Each order is sent only once.', 'codemas-ewand-ordersync' ); ?>">
+				<button type="button" class="button button-primary ce-send-filtered" <?php disabled( 0, $unsent ); ?> title="<?php esc_attr_e( 'Sends every not-yet-sent order in the From–To dates (and search) entered, across all pages. Each order is sent only once.', 'codemas-ewand-ordersync' ); ?>">
 					<?php
 					/* translators: %d: number of orders */
 					echo esc_html( sprintf( __( 'Send unsent in date range to Ewand (%d)', 'codemas-ewand-ordersync' ), $unsent ) );

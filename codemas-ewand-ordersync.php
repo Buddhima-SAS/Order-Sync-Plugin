@@ -19,6 +19,12 @@ define( 'CODEMAS_EWAND_VERSION', '1.0' );
 define( 'CODEMAS_EWAND_FILE', __FILE__ );
 define( 'CODEMAS_EWAND_DIR', plugin_dir_path( __FILE__ ) );
 
+/* Setup time: only orders created after it are listed. add_option() never overwrites, so reactivating keeps it. */
+define( 'CODEMAS_EWAND_SETUP_OPTION', 'codemas_ewand_setup_time' );
+register_activation_hook( __FILE__, function () {
+	add_option( CODEMAS_EWAND_SETUP_OPTION, time(), '', false );
+} );
+
 /* Declare HPOS (custom order tables) compatibility */
 add_action( 'before_woocommerce_init', function () {
 	if ( class_exists( \Automattic\WooCommerce\Utilities\FeaturesUtil::class ) ) {
@@ -30,6 +36,9 @@ add_action( 'plugins_loaded', function () {
 	if ( ! class_exists( 'WooCommerce' ) ) {
 		return;
 	}
+
+	// Already active before the setup time existed (no activation run): start from now
+	add_option( CODEMAS_EWAND_SETUP_OPTION, time(), '', false );
 
 	require_once CODEMAS_EWAND_DIR . 'includes/class-settings.php';
 	require_once CODEMAS_EWAND_DIR . 'includes/class-product-fields.php';
